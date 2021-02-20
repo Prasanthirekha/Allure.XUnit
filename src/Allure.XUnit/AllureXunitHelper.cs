@@ -1,185 +1,284 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Reflection;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Allure.Commons;
+using Allure.XUnit;
 using Allure.Xunit.Attributes;
-using Xunit.Sdk;
+using Xunit.Abstractions;
 
 namespace Allure.Xunit
 {
     public class AllureXunitHelper
     {
-        private readonly IXunitTestCase _test;
-
-        private string _containerGuid;
-        private static object ObjectLock => new object();
-        private string _testResultGuid;
-        public Dictionary<string, StatusDetails> StatusDetails { get; }
+        internal static readonly AsyncLocal<List<ExecutableItem>> Steps = new();
+        private static readonly AsyncLocal<TestResultContainer> TestResultContainer = new();
+        private static readonly AsyncLocal<TestResult> TestResult = new();
 
         static AllureXunitHelper()
         {
             const string allureConfigEnvVariable = "ALLURE_CONFIG";
             const string allureConfigName = "allureConfig.json";
-            
-            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable(allureConfigEnvVariable)))
-                return;
 
-            var allureConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
-                allureConfigName);
-            
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable(allureConfigEnvVariable)))
+            {
+                return;
+            }
+
+            var allureConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, allureConfigName);
+
             Environment.SetEnvironmentVariable(allureConfigEnvVariable, allureConfigPath);
         }
 
-        public AllureXunitHelper(IXunitTestCase test)
+        public static void StartTestCase(ITestCaseStarting testCaseStarting)
         {
-            StatusDetails = new Dictionary<string, StatusDetails>();
-            _test = test;
-            var assemblyName = _test.TestMethod.TestClass.Class.Assembly.Name;
-
-            if (_testAssembly != null)
-                return;
-
-            lock (ObjectLock)
+            StartTestContainer(testCaseStarting.TestClass);
+            var testCase = testCaseStarting.TestCase;
+            var uuid = NewUuid(testCase.DisplayName);
+            TestResult.Value = new()
             {
-                if (_testAssembly == null) _testAssembly = Assembly.Load(assemblyName);
-            }
-        }
-
-        private static Assembly _testAssembly;
-        private static AllureLifecycle AllureLifecycle => AllureLifecycle.Instance;
-
-        private void StartTestContainer()
-        {
-            const string  testContainerInterfix = "-tc-";
-            _containerGuid = string.Concat(Guid.NewGuid().ToString(), testContainerInterfix , _test.UniqueID);
-            var container = new TestResultContainer
-            {
-                uuid = _containerGuid,
-                name = _test.DisplayName
-            };
-            AllureLifecycle.StartTestContainer(container);
-        }
-
-        private void StartTestCase()
-        {
-            const string  testResultInterfix = "-tc-";
-
-            _testResultGuid = string.Concat(Guid.NewGuid().ToString(), testResultInterfix, _test.DisplayName);
-            var testResult = new TestResult
-            {
-                uuid = _testResultGuid,
-                name = _test.DisplayName,
-                historyId = _test.DisplayName,
-                fullName = _test.DisplayName,
-                labels = new List<Label>
+                uuid = uuid,
+                name = testCase.DisplayName,
+                historyId = testCase.DisplayName,
+                fullName = testCase.DisplayName,
+                labels = new()
                 {
                     Label.Thread(),
                     Label.Host(),
-                    Label.TestClass(_test.TestMethod.TestClass.Class.Name),
-                    Label.TestMethod(_test.DisplayName),
-                    Label.Package(_test.TestMethod.TestClass.Class.Name)
+                    Label.TestClass(testCase.TestMethod.TestClass.Class.Name),
+                    Label.TestMethod(testCase.DisplayName),
+                    Label.Package(testCase.TestMethod.TestClass.Class.Name)
                 }
             };
-            AllureLifecycle.StartTestCase(_containerGuid, testResult);
+            UpdateTestDataFromAttributes(TestResult.Value, testCase);
+            AllureLifecycle.Instance.StartTestCase(TestResultContainer.Value.uuid, TestResult.Value);
         }
 
-        public void StopAll(RunSummary runSummary, ExceptionAggregator aggregator, bool isWrappedIntoStep = false)
+        public static void MarkTestCaseAsFailed(ITestFailed testFailed)
         {
-            StopTestCase(runSummary, aggregator);
-
-            StopTestContainer();
+            var statusDetails = TestResult.Value.statusDetails ??= new();
+            statusDetails.trace = string.Join('\n', testFailed.StackTraces);
+            statusDetails.message = string.Join('\n', testFailed.Messages);
+            TestResult.Value.status = Status.failed;
         }
 
-        private void StopTestCase(RunSummary runSummary, ExceptionAggregator aggregator)
+        public static void MarkTestCaseAsPassed(ITestPassed testPassed)
         {
-            UpdateTestDataFromAttributes();
-            if (StatusDetails.ContainsKey(_test.UniqueID))
-                AllureLifecycle.UpdateTestCase(x => x.statusDetails = StatusDetails[_test.UniqueID]);
-
-            AllureLifecycle.StopTestCase(testCase => testCase.status = GeTestStatus(runSummary));
-            AllureLifecycle.WriteTestCase(_testResultGuid);
+            var statusDetails = TestResult.Value.statusDetails ??= new();
+            statusDetails.message = testPassed.Output;
+            TestResult.Value.status = Status.passed;
         }
 
-        private void StopTestContainer()
+        public static void FinishTestCase()
         {
-            AllureLifecycle.StopTestContainer(_containerGuid);
-            AllureLifecycle.WriteTestContainer(_containerGuid);
+            AllureLifecycle.Instance.StopTestCase(TestResult.Value.uuid);
+            AllureLifecycle.Instance.WriteTestCase(TestResult.Value.uuid);
+            AllureLifecycle.Instance.StopTestContainer(TestResultContainer.Value.uuid);
+            AllureLifecycle.Instance.WriteTestContainer(TestResultContainer.Value.uuid);
         }
 
-        public void StartAll(bool isWrappedIntoStep)
+        public static void StartBeforeFixture(string name)
         {
-            StartTestContainer();
-            StartTestCase();
+            var fixtureResult = new FixtureResult
+            {
+                name = name,
+                stage = Stage.running,
+                start = DateTimeOffset.Now.ToUnixTimeMilliseconds()
+            };
+
+            TestResultContainer.Value.befores ??= new();
+            TestResultContainer.Value.befores.Add(fixtureResult);
+            Steps.Value.Add(fixtureResult);
+            Log($"Started Before: {name}");
         }
 
-        private static Status GeTestStatus(RunSummary runSummary)
+        public static void StartAfterFixture(string name)
         {
-            if (runSummary.Failed == 1)
-                return Status.failed;
-            if (runSummary.Skipped == 1)
-                return Status.skipped;
-            if (runSummary.Total == 1)
-                return Status.passed;
+            var fixtureResult = new FixtureResult
+            {
+                name = name,
+                stage = Stage.running,
+                start = DateTimeOffset.Now.ToUnixTimeMilliseconds()
+            };
 
-            return Status.none;
+            TestResultContainer.Value.afters ??= new();
+            TestResultContainer.Value.afters.Add(fixtureResult);
+            Steps.Value.Add(fixtureResult);
+            Log($"Started After: {name}");
         }
 
-        private void UpdateTestDataFromAttributes()
+        public static void StartStep(string name)
         {
-            var className = _test.TestMethod.TestClass.Class.Name;
-            var methodName = _test.Method.Name;
-            var attributes = _testAssembly.GetType(className).GetMethod(methodName)
-                .GetCustomAttributes(typeof(IAllureInfo), true);
+            var stepResult = new StepResult
+            {
+                name = name,
+                stage = Stage.running,
+                start = DateTimeOffset.Now.ToUnixTimeMilliseconds()
+            };
+            var parent = Steps.Value.LastOrDefault();
+            if (parent == null)
+            {
+                parent = TestResult.Value;
+            }
+
+            parent.steps ??= new();
+            parent.steps.Add(stepResult);
+            Steps.Value.Add(stepResult);
+            Log($"Started Step: {name}");
+        }
+
+        public static void PassStep()
+        {
+            PassStep(Steps.Value.Last());
+        }
+
+        public static void PassStep(ExecutableItem step)
+        {
+            Steps.Value.Remove(step);
+            step.stage = Stage.finished;
+            step.stop = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+            step.status = Status.passed;
+            Log("Passed");
+        }
+
+        public static void FailStep()
+        {
+            FailStep(Steps.Value.Last());
+        }
+
+        public static void FailStep(ExecutableItem step)
+        {
+            Steps.Value.Remove(step);
+            step.stage = Stage.finished;
+            step.stop = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+            step.status = Status.failed;
+            Log("Failed");
+        }
+
+        public static async Task AddAttachment(string name, string type, byte[] content, string fileExtension)
+        {
+            var source = $"{Guid.NewGuid():N}{AllureConstants.ATTACHMENT_FILE_SUFFIX}{fileExtension}";
+            await File.WriteAllBytesAsync(Path.Combine(AllureLifecycle.Instance.ResultsDirectory, source), content);
+            List<Attachment> attachments;
+            if (Steps.Value.Any())
+            {
+                attachments = Steps.Value.Last().attachments ??= new();
+            }
+            else
+            {
+                attachments = TestResult.Value.attachments ??= new();
+            }
+            attachments.Add(new()
+            {
+                name = name,
+                type = type,
+                source = source
+            });
+        }
+
+        private static void StartTestContainer(ITestClass testClass)
+        {
+            var uuid = NewUuid(testClass.Class.Name);
+            TestResultContainer.Value = new()
+            {
+                uuid = uuid,
+                name = testClass.Class.Name
+            };
+            AllureLifecycle.Instance.StartTestContainer(TestResultContainer.Value);
+        }
+
+        private static string NewUuid(string name)
+        {
+            var uuid = string.Concat(Guid.NewGuid().ToString(), "-", name);
+            return uuid;
+        }
+
+        private static void Log(string message)
+        {
+            AllureMessageBus.TestOutputHelper.Value.WriteLine("╬════════════════════════");
+            AllureMessageBus.TestOutputHelper.Value.WriteLine($"║ {message}");
+            AllureMessageBus.TestOutputHelper.Value.WriteLine("╬═══════════════");
+        }
+
+        private static void UpdateTestDataFromAttributes(TestResult testResult, ITestCase testCase)
+        {
+            var attributes = testCase.TestMethod.Method.GetCustomAttributes(typeof(IAllureInfo));
 
             foreach (var attribute in attributes)
-                switch (attribute)
+            {
+                switch (((IReflectionAttributeInfo) attribute).Attribute)
                 {
-                    case AllureFeatureAttribute featureAttr:
-                        foreach (var feature in featureAttr.Features)
-                            AllureLifecycle.UpdateTestCase(x => x.labels.Add(Label.Feature(feature)));
+                    case AllureFeatureAttribute featureAttribute:
+                        foreach (var feature in featureAttribute.Features)
+                        {
+                            testResult.labels.Add(Label.Feature(feature));
+                        }
+
                         break;
-                    case AllureLinkAttribute linkAttr:
-                        AllureLifecycle.UpdateTestCase(x => x.links.Add(linkAttr.Link));
+
+                    case AllureLinkAttribute linkAttribute:
+                        testResult.links.Add(linkAttribute.Link);
                         break;
+
                     case AllureIssueAttribute issueAttribute:
-                        AllureLifecycle.UpdateTestCase(x => x.links.Add(issueAttribute.IssueLink));
+                        testResult.links.Add(issueAttribute.IssueLink);
                         break;
+
                     case AllureOwnerAttribute ownerAttribute:
-                        AllureLifecycle.UpdateTestCase(x => x.labels.Add(Label.Owner(ownerAttribute.Owner)));
+                        testResult.labels.Add(Label.Owner(ownerAttribute.Owner));
                         break;
-                    case AllureSuiteAttribute suiteAttr:
-                        AllureLifecycle.UpdateTestCase(x => x.labels.Add(Label.Suite(suiteAttr.Suite)));
+
+                    case AllureSuiteAttribute suiteAttribute:
+                        testResult.labels.Add(Label.Suite(suiteAttribute.Suite));
                         break;
-                    case AllureSubSuiteAttribute subSuiteAttr:
-                        AllureLifecycle.UpdateTestCase(
-                            x => x.labels.Add(Label.SubSuite(subSuiteAttr.SubSuite)));
+
+                    case AllureSubSuiteAttribute subSuiteAttribute:
+                        testResult.labels.Add(Label.SubSuite(subSuiteAttribute.SubSuite));
                         break;
-                    case AllureEpicAttribute epicAttr:
-                        AllureLifecycle.UpdateTestCase(x => x.labels.Add(Label.Epic(epicAttr.Epic)));
+
+                    case AllureEpicAttribute epicAttribute:
+                        testResult.labels.Add(Label.Epic(epicAttribute.Epic));
                         break;
-                    case AllureTagAttribute tagAttr:
-                        foreach (var tag in tagAttr.Tags)
-                            AllureLifecycle.UpdateTestCase(x => x.labels.Add(Label.Tag(tag)));
+
+                    case AllureTagAttribute tagAttribute:
+                        foreach (var tag in tagAttribute.Tags)
+                        {
+                            testResult.labels.Add(Label.Tag(tag));
+                        }
+
                         break;
-                    case AllureSeverityAttribute severityAttr:
-                        AllureLifecycle.UpdateTestCase(
-                            x => x.labels.Add(Label.Severity(severityAttr.Severity)));
+
+                    case AllureSeverityAttribute severityAttribute:
+                        testResult.labels.Add(Label.Severity(severityAttribute.Severity));
                         break;
-                    case AllureParentSuiteAttribute parentSuiteAttr:
-                        AllureLifecycle.UpdateTestCase(x =>
-                            x.labels.Add(Label.ParentSuite(parentSuiteAttr.ParentSuite)));
+
+                    case AllureParentSuiteAttribute parentSuiteAttribute:
+                        testResult.labels.Add(Label.ParentSuite(parentSuiteAttribute.ParentSuite));
                         break;
-                    case AllureStoryAttribute storyAttr:
-                        foreach (var story in storyAttr.Stories)
-                            AllureLifecycle.UpdateTestCase(x => x.labels.Add(Label.Story(story)));
+
+                    case AllureStoryAttribute storyAttribute:
+                        foreach (var story in storyAttribute.Stories)
+                        {
+                            testResult.labels.Add(Label.Story(story));
+                        }
+
                         break;
+
                     case AllureDescriptionAttribute descriptionAttribute:
-                        AllureLifecycle.UpdateTestCase(x => x.description = descriptionAttribute.Description);
+                        testResult.description = descriptionAttribute.Description;
                         break;
-                    case AllureAddAttachmentAttribute allureAddAttachmentAttr:
+
+                    case AllureLabelAttribute labelAttribute:
+                        testResult.labels.Add(new()
+                        {
+                            name = labelAttribute.Label,
+                            value = labelAttribute.Value
+                        });
                         break;
                 }
+            }
         }
     }
 }
